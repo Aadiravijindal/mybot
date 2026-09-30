@@ -1,0 +1,11 @@
+services:
+  mybot:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "127.0.0.1:8000:8000"   # localhost only; use a VPN / auth proxy for remote access
+    volumes:
+      - ./var:/app/var
+    restart: unless-stopped

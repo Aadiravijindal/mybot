@@ -1,0 +1,29 @@
+# mybot default configuration. Risk limits here are HARD limits: the engine cannot
+# change them at runtime. Edit, then restart.
+mode = "paper"
+data_source = "synthetic"      # synthetic | alpaca
+symbols = ["AAPL", "MSFT", "NVDA", "AMD", "JPM", "XOM", "TSLA", "META"]
+market_proxy = "SPY"
+starting_equity = 100000.0
+replay_speed = 60.0            # synthetic mode: 1 wall-second = 60 market-seconds
+
+[risk]
+risk_per_trade_pct = 0.25
+max_position_notional_pct = 20.0
+max_gross_exposure_pct = 100.0
+max_sector_exposure_pct = 40.0
+max_open_positions = 5
+max_daily_loss_pct = 1.5
+max_drawdown_pct = 6.0
+max_trades_per_day = 20
+max_spread_bps = 25.0
+emergency_stop_pct = 3.0
+allow_short = true
+
+[costs]
+commission_per_share = 0.0035
+slippage_bps = 2.0
+
+[strategy]
+min_ev_r = 0.10
+min_prob_lcb = 0.35
