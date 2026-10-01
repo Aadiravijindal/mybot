@@ -1,0 +1,19 @@
+# End-to-end test config: real code paths, entry gates relaxed so trades actually happen in a short run.
+mode = "paper"
+data_source = "alpaca"
+symbols = ["AAPL", "MSFT", "NVDA", "AMD", "JPM", "XOM", "TSLA", "META"]
+market_proxy = "SPY"
+starting_equity = 100000.0
+
+[risk]
+max_trades_per_day = 60
+max_consecutive_losses = 1000
+max_daily_loss_pct = 20.0
+max_drawdown_pct = 50.0
+max_clock_drift_s = 5.0
+
+[strategy]
+min_ev_r = -9.0
+min_prob_lcb = 0.0
+min_reward_risk = 0.0
+min_analogues = 0

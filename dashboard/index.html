@@ -40,6 +40,8 @@ button { font: inherit; cursor: pointer; border-radius: 8px; padding: 6px 12px; 
   background: var(--surface-2); color: var(--ink); }
 button:focus-visible, summary:focus-visible, tr:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 button.kill { background: var(--critical); color: #fff; border-color: transparent; font-weight: 700; }
+.pill.live { background: var(--critical); color: #fff; border-color: transparent; }
+.banner.live { border-color: var(--critical); color: var(--ink); }
 .banner { margin: 12px 16px 0; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border);
   background: var(--surface); color: var(--ink-2); display: flex; gap: 8px; align-items: center; }
 main { padding: 12px 16px 40px; display: grid; gap: 12px; grid-template-columns: repeat(12, minmax(0, 1fr)); }
@@ -179,12 +181,16 @@ async function tick() {
 
 function render(s) {
   const m = s.meta, a = s.account, rk = s.risk;
-  $("mode").innerHTML = `<span class="dot" style="background:${m.simulated ? "var(--warning)" : "var(--series-1)"}"></span>${esc(m.mode)}`;
+  const live = m.mode.startsWith("LIVE");
+  $("mode").className = "pill" + (live ? " live" : "");
+  $("mode").innerHTML = live ? `<span aria-hidden="true">●</span>${esc(m.mode)}`
+    : `<span class="dot" style="background:${m.simulated ? "var(--warning)" : "var(--series-1)"}"></span>${esc(m.mode)}`;
   $("clock").textContent = m.local_time;
   $("market").innerHTML = m.market_open ? `<span class="dot" style="background:var(--good)"></span>Market open` : `<span class="dot"></span>Market closed`;
   $("risk").innerHTML = badge(rk.state);
   $("status").textContent = m.status_line;
-  $("banner").innerHTML = m.simulated ? `<div class="banner"><span aria-hidden="true" style="color:var(--warning)">▲</span><span><b>Simulated market.</b> Prices, news and fills are generated so the whole pipeline runs without credentials. Nothing here is evidence of real-world edge. Paper-trade on real data before risking capital.</span></div>` : "";
+  $("banner").innerHTML = live ? `<div class="banner live"><span aria-hidden="true" style="color:var(--critical)">■</span><span><b>LIVE TRADING: real money.</b> Orders go to your real brokerage account. Hard risk limits still apply; the kill switch flattens everything.</span></div>`
+    : m.simulated ? `<div class="banner"><span aria-hidden="true" style="color:var(--warning)">▲</span><span><b>Simulated market.</b> Prices, news and fills are generated so the whole pipeline runs without credentials. Nothing here is evidence of real-world edge. Paper-trade on real data before risking capital.</span></div>` : "";
 
   $("k-eq").textContent = money(a.equity); $("k-eq-d").textContent = `cash ${money(a.cash)} · gross ${money(a.gross_exposure)}`;
   $("k-day").innerHTML = `<span class="${cls(a.day_pnl)}">${a.day_pnl < 0 ? "−" : ""}$${fmt(Math.abs(a.day_pnl))}</span>`;
@@ -204,7 +210,8 @@ function render(s) {
   }).join("");
   const f = s.funnel || {};
   $("funnel").innerHTML = ["ENTER", "WATCH", "AVOID"].map((k) => `<span class="tag">${badge(k)} ${f[k] || 0}</span>`).join("") + `<span class="tag">universe ${f.universe || 0}</span>`;
-  $("riskreasons").innerHTML = (rk.recent_reasons || []).slice(-3).reverse().map((r) => `<div>${tstr(r.ts)} · ${badge(r.state)} ${esc(r.reason)}</div>`).join("");
+  $("riskreasons").innerHTML = (rk.pdt_day_trades_left != null ? `<div>Pattern-day-trader rule: <b>${rk.pdt_day_trades_left}</b> day trade(s) left (account under $25k)</div>` : "")
+    + (rk.recent_reasons || []).slice(-3).reverse().map((r) => `<div>${tstr(r.ts)} · ${badge(r.state)} ${esc(r.reason)}</div>`).join("");
 
   renderPositions(s.positions);
   renderDecisions(s.decisions);

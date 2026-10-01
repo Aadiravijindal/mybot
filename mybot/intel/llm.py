@@ -61,14 +61,18 @@ class LLMResearcher:
 
     def _extract(self, headline: str, body: str, symbols: tuple[str, ...]) -> dict | None:
         try:
-            resp = self._client.messages.create(
+            # Server-side fallback: if a safety classifier declines, the API retries on a
+            # suitable model instead of failing the extraction.
+            resp = self._client.beta.messages.create(
                 model=self.model,
                 max_tokens=2000,
                 system=SYSTEM,
                 output_config={"effort": "low", "format": {"type": "json_schema", "schema": SCHEMA}},
                 messages=[{"role": "user", "content": f"Tickers: {', '.join(symbols)}\nHeadline: {headline}\n\n{body[:20000]}"}],
+                betas=["server-side-fallback-2026-07-01"],
+                fallbacks="default",
             )
-            if resp.stop_reason == "refusal":
+            if resp.stop_reason in ("refusal", "max_tokens"):
                 return None
             text = "".join(b.text for b in resp.content if b.type == "text")
             return json.loads(text)

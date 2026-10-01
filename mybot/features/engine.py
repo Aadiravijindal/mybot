@@ -88,8 +88,9 @@ class Micro:
 
 
 class SymbolFeatures:
-    def __init__(self, symbol: str, session: Session):
+    def __init__(self, symbol: str, session: Session, bar_seconds: int = 60):
         self.symbol, self.session = symbol, session
+        self.bars_per_day = session.length_min * 60 / bar_seconds
         self.bars: deque[Bar] = deque(maxlen=400)
         self.n = 0
         self.day: str | None = None
@@ -210,7 +211,7 @@ class SymbolFeatures:
             v["rv_pct"] = self.rv_hist.percentile_rank(rv) if len(self.rv_hist.buf) >= 60 else 0.5
         if self.vol_avg.ready and self.vol_avg.mean > 0:
             v["rel_volume"] = b.volume / self.vol_avg.mean
-            v["avg_dollar_vol_day"] = self.vol_avg.mean * c * 390
+            v["avg_dollar_vol_day"] = self.vol_avg.mean * c * self.bars_per_day
         if self.obv_ema.value is not None:
             v["obv_slope"] = 1.0 if self.obv > self.obv_ema.value else -1.0
         if self.or_high is not None and mso > 15:

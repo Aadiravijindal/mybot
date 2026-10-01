@@ -82,6 +82,7 @@ class Settings:
     session_close: str = "16:00"
     data_dir: str = "var"
     replay_speed: float = 60.0        # synthetic: simulated seconds per wall second
+    bar_seconds: int = 60             # base bar size fed to the engine (60 = 1-minute bars, 300 = 5-minute)
     host: str = "127.0.0.1"
     port: int = 8000
     risk: RiskLimits = field(default_factory=RiskLimits)

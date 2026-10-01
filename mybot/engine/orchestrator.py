@@ -52,7 +52,14 @@ class TradingSystem:
         self.session = Session(settings.timezone, settings.session_open, settings.session_close)
         self.bus = EventBus(clock)
         self.bus.on_error = lambda ev, exc: self.risk.record_component_error(f"{ev.topic.value}: {exc}", self.clock.now())
-        self.dq = DataQualityEngine(max_staleness_s=settings.risk.max_data_staleness_s)
+        self.bar_s = settings.bar_seconds
+        # A feed of N-second bars is legitimately silent for N seconds between bars.
+        self.staleness_limit = max(settings.risk.max_data_staleness_s, 2 * self.bar_s + 60)
+        self.dq = DataQualityEngine(max_staleness_s=self.staleness_limit, bar_seconds=self.bar_s)
+        self.allow_entries = True   # False during warm-up / history replay in live mode
+        self.stream_start_ts = 0.0  # set by the runtime when live data streaming begins
+        # Knowledge-base partition: simulated and real-data analogues never mix.
+        self.kb_source = "synthetic" if settings.data_source == "synthetic" else "real"
         self.feat: dict[str, SymbolFeatures] = {}
         self.regimes: dict[str, RegimeTracker] = defaultdict(RegimeTracker)
         self.news = NewsIntel()
@@ -71,6 +78,7 @@ class TradingSystem:
         self.llm = LLMResearcher() if enable_llm else None
         self._llm_futures: list = []
         self.pending_entries: dict[str, dict] = {}     # order_id -> context
+        self._own_cancels: set[str] = set()            # stop orders we cancelled ourselves
         self.exit_orders: dict[str, str] = {}          # order_id -> symbol
         self.cooldown: dict[tuple, float] = {}
         self.scanner: dict[str, dict] = {}
@@ -102,7 +110,7 @@ class TradingSystem:
         import numpy as _np
         from ..signals.analogues import Outcome
         n = 0
-        for row in self.J.load_outcomes():
+        for row in self.J.load_outcomes(self.kb_source):
             setup, side, st_, ot, r, mae, mfe, ex, regime, vec = row
             self.analogues.add(Outcome(setup, side, st_, ot, r, mae, mfe, 0, ex, _np.array(_json.loads(vec)), regime))
             n += 1
@@ -119,7 +127,7 @@ class TradingSystem:
     # ================================================================ helpers
     def f(self, sym: str) -> SymbolFeatures:
         if sym not in self.feat:
-            self.feat[sym] = SymbolFeatures(sym, self.session)
+            self.feat[sym] = SymbolFeatures(sym, self.session, self.bar_s)
         return self.feat[sym]
 
     def _cost_r(self, c: Candidate) -> float:
@@ -171,7 +179,7 @@ class TradingSystem:
         self.drift.observe_features(fv, live=self.live)
         for o in self.labeler.on_bar(b.symbol, b.high, b.low, b.close, b.end_ts):
             self.analogues.add(o)
-            self.J.outcome(o)
+            self.J.outcome(o, self.kb_source)
         self.impact.on_price(b.symbol, b.end_ts, b.close)
         reg, changed = self.regimes[b.symbol].update(fv, now)
         if changed:
@@ -274,16 +282,19 @@ class TradingSystem:
         if mso < st.no_entry_first_min:
             row["stage"] = "L1: opening auction window"; return
         # L2/L3: hypotheses.
-        cands = generate(sym, now, fv, reg, cat, st.atr_stop_mult, L.allow_short)
+        cands = generate(sym, now, fv, reg, cat, st.atr_stop_mult, L.allow_short, self.bar_s)
         row["stage"] = "L2 scanned" if not cands else "L3 candidate"
         if not cands:
             return
         for c in cands:
             key = (sym, c.setup, c.side)
-            if now - self.cooldown.get(key, 0) < 10 * 60:
+            if now - self.cooldown.get(key, 0) < max(600, 3 * self.bar_s):
                 continue
             self.cooldown[key] = now
             self.labeler.add(c, reg.value)         # label every candidate (no selection bias)
+            if not self.allow_entries:
+                row["stage"] = "warm-up (history replay): labelling only"
+                continue
             if sym in self.book.positions or any(ctx["c"].symbol == sym for ctx in self.pending_entries.values()):
                 continue
             self._decide(c, fv, reg, cat, cat_items, dq, mtc, row, now)
@@ -297,7 +308,7 @@ class TradingSystem:
         bull = evmod.gather(c, fv, mkt, rs, cat, dq.score, self.weights)
         an = self.analogues.query(c.setup, c.side.sign, fv, now)
         contra_news = [a for a in cat_items if a.direction * c.side.sign < 0]
-        upcoming = self.calendar.upcoming(c.symbol, now, st.event_blackout_min * 60 + c.horizon_bars * 60, 2)
+        upcoming = self.calendar.upcoming(c.symbol, now, st.event_blackout_min * 60 + c.horizon_bars * self.bar_s, 2)
         # L5 adversarial.
         ch = adversarial.challenge(c, fv, market_regime=mkt, catalyst=cat, upcoming_events=upcoming, an=an,
                                    dq_ok=dq.ok, spread_bps=fv.get("spread_bps", 0.0), max_spread_bps=L.max_spread_bps,
@@ -340,7 +351,7 @@ class TradingSystem:
             "catalysts": [{"headline": a.headline, "type": a.event_type, "dir": a.direction, "materiality": a.materiality,
                            "source": a.source} for a in cat_items[:5]],
             "analogues": None if an is None else {k: round(v, 3) if isinstance(v, float) else v for k, v in an.__dict__.items()},
-            "forecast": fc.to_dict(), "expected_holding_min": c.horizon_bars,
+            "forecast": fc.to_dict(), "expected_holding_min": round(c.horizon_bars * self.bar_s / 60),
             "entry_zone": [round(c.entry - 0.1 * fv["atr"], 2), round(c.entry + 0.1 * fv["atr"], 2)],
             "invalidation": round(c.stop, 2), "targets": [round(t, 2) for t in c.targets],
             "position_size": rd.qty if (rd and rd.approved) else 0, "risk_dollars": round(risk_dollars, 2),
@@ -379,6 +390,13 @@ class TradingSystem:
         p = self.book.positions[b.symbol]
         now = self.clock.now()
         p.bars_held += 1
+        if p.working_exit:
+            return   # an exit/reduce order is in flight; never stack a second one
+        if p.stop_order_id is None:
+            # No resting stop (rejected, lost, or a previous exit failed): close, retrying every bar.
+            p.exiting = False
+            self._exit(p, p.qty, "unprotected position (no resting stop at broker): closing", now)
+            return
         if p.exiting:
             return
         mkt = self._mkt_regime()
@@ -419,15 +437,51 @@ class TradingSystem:
             self._exit(p, p.qty, f"thesis invalid: {last[3]}", now)
 
     def _exit(self, p: Position, qty: int, reason: str, now: float, full: bool = True) -> None:
-        if qty <= 0:
+        if qty <= 0 or p.working_exit:
             return
+        # Release the shares held by the resting stop first. Otherwise a real broker
+        # rejects the exit (shares reserved by the stop), or both orders fill and the
+        # position flips to the other side.
+        if p.stop_order_id and not self._cancel_stop(p):
+            return      # the stop already filled: the position is closing via its fill
         if full:
             p.exiting = True
-        o = Order(p.symbol, -p.side, qty, OrderType.MARKET, now, "exit" if full else "reduce",
+        o = Order(p.symbol, -p.side, min(qty, p.qty), OrderType.MARKET, now, "exit" if full else "reduce",
                   decision_px=self.book.marks.get(p.symbol, p.avg_px))
         self.exit_orders[o.id] = reason
+        p.working_exit = o.id
         self.risk.on_order_sent(now, opening=False)
         self.broker.submit(o)
+
+    def _cancel_stop(self, p: Position) -> bool:
+        """Cancel the resting stop. Marked as ours BEFORE the broker call, because the
+        cancel callback can fire synchronously and must not be mistaken for a lost stop."""
+        oid = p.stop_order_id
+        self._own_cancels.add(oid)
+        if not self.broker.cancel(oid):
+            self._own_cancels.discard(oid)
+            return False
+        if p.stop_order_id == oid:
+            p.stop_order_id = None
+        return True
+
+    def _place_stop(self, p: Position, now: float) -> None:
+        """(Re)place the broker-resident protective stop for the full current quantity."""
+        if p.stop_order_id and not self._cancel_stop(p):
+            return
+        so = self.broker.submit(Order(p.symbol, -p.side, p.qty, OrderType.STOP, now, "stop", stop=p.stop.current))
+        if so.status is not OrderStatus.REJECTED:
+            p.stop_order_id = so.id
+            p.stop_failures = 0
+            return
+        # The broker refused the protective stop (note: its callback fired before we knew
+        # the id, so handle it here). A position must never sit unprotected: close it.
+        p.stop_failures += 1
+        self.risk.record_component_error(f"protective stop rejected: {p.symbol} ({so.reject_reason})", now)
+        self.J.write("risk", now, {"event": "stop_lost", "state": self.risk.state.value,
+                                    "reason": f"{p.symbol} stop rejected: {so.reject_reason}; closing position"})
+        if not p.working_exit:
+            self._exit(p, p.qty, "protective stop rejected by broker", now)
 
     # ================================================================ broker callbacks
     def _on_order(self, o: Order) -> None:
@@ -435,20 +489,31 @@ class TradingSystem:
         self.J.write("order", now, {"id": o.id, "symbol": o.symbol, "side": o.side, "qty": o.qty, "type": o.type.value,
                                      "tag": o.tag, "status": o.status.value, "filled": o.filled,
                                      "avg_px": round(o.avg_px, 4), "reason": o.reject_reason})
-        if o.status is OrderStatus.REJECTED:
-            if o.id in self.pending_entries:
-                self.pending_entries.pop(o.id)
-            if o.tag in ("exit", "reduce", "flatten"):
-                p = self.book.positions.get(o.symbol)
-                if p:
-                    p.exiting = False   # retry next bar; the resting stop still protects
-                self.risk.record_component_error(f"exit order rejected: {o.symbol}", now)
-        if o.status in (OrderStatus.CANCELED,) and o.id in self.pending_entries:
-            self.pending_entries.pop(o.id)
-        if o.status is OrderStatus.CANCELED and o.tag in ("exit", "reduce"):
-            p = self.book.positions.get(o.symbol)
-            if p:
+        if not o.done:
+            return
+        p = self.book.positions.get(o.symbol)
+        if o.tag == "entry" and o.status is not OrderStatus.FILLED:
+            self.pending_entries.pop(o.id, None)
+        elif o.tag in ("exit", "reduce") and o.status is not OrderStatus.FILLED:
+            # Exit did not (fully) happen: re-protect the remainder immediately and retry next bar.
+            if p and p.working_exit == o.id:
+                p.working_exit = None
                 p.exiting = False
+                if p.stop_order_id is None and p.stop_failures == 0:
+                    self._place_stop(p, now)   # re-protect; if stops are being refused, the next bar retries the exit
+            if o.status is OrderStatus.REJECTED:
+                self.risk.record_component_error(f"exit order rejected: {o.symbol} ({o.reject_reason})", now)
+        elif o.tag == "stop" and o.status is not OrderStatus.FILLED:
+            if p and p.stop_order_id == o.id and o.id not in self._own_cancels:
+                # The broker rejected or cancelled our protective stop. Never sit unprotected.
+                p.stop_order_id = None
+                self.risk.record_component_error(f"protective stop {o.status.value.lower()}: {o.symbol} ({o.reject_reason})", now)
+                self.J.write("risk", now, {"event": "stop_lost", "state": self.risk.state.value,
+                                            "reason": f"{o.symbol} stop {o.status.value}: {o.reject_reason}; exiting"})
+                if o.status is OrderStatus.REJECTED:
+                    self._exit(p, p.qty, "protective stop rejected by broker", now)
+                else:
+                    self._place_stop(p, now)
 
     def _on_fill(self, fl: Fill) -> None:
         now = self.clock.now()
@@ -472,14 +537,13 @@ class TradingSystem:
                 self.book.positions[c.symbol] = p
                 self.drift.record_slippage(slip)
                 self.risk.record_slippage(slip, now)
-                so = self.broker.submit(Order(c.symbol, -c.side.sign, fl.qty, OrderType.STOP, now, "stop", stop=st.current))
-                p.stop_order_id = so.id
+                self._place_stop(p, now)
             else:
                 p.avg_px = (p.avg_px * p.qty + fl.price * fl.qty) / (p.qty + fl.qty)
                 p.qty += fl.qty
                 p.orig_qty += fl.qty
                 p.fees += fl.fees
-                self._resize_stop(p, now)
+                self._place_stop(p, now)
             if o is not None and o.done:
                 self.pending_entries.pop(fl.order_id, None)
             return
@@ -494,22 +558,26 @@ class TradingSystem:
         reason = self.exit_orders.get(fl.order_id, "stop hit" if fl.tag == "stop" else fl.tag)
         if fl.tag == "stop":
             reason = f"stop hit ({p.stop.history[-1][2] if p.stop.history else 'initial'} stop)"
+        if p.qty < 0:   # over-fill: should be impossible; position state is now uncertain
+            self.risk.halt(f"over-fill on {p.symbol}: book qty {p.qty}", now)
         if p.qty <= 0:
             self._close(p, fl, reason, now)
-        else:
-            self._resize_stop(p, now)
-            self.J.write("stop", now, {"symbol": p.symbol, "stop": round(p.stop.current, 4), "reason": f"{reason}; stop resized to {p.qty}",
+            return
+        o = getattr(self.broker, "orders", {}).get(fl.order_id)
+        if fl.tag in ("exit", "reduce") and (o is None or o.done):
+            p.working_exit = None
+            if fl.tag == "reduce":
+                p.exiting = False
+            self._place_stop(p, now)   # protect the remainder only once the exit order is finished
+            self.J.write("stop", now, {"symbol": p.symbol, "stop": round(p.stop.current, 4), "reason": f"{reason}; stop re-placed for {p.qty}",
                                         "components": p.stop.components, "r_now": round(p.r_now(fl.price), 2)})
-
-    def _resize_stop(self, p: Position, now: float) -> None:
-        if p.stop_order_id:
-            self.broker.cancel(p.stop_order_id)
-        so = self.broker.submit(Order(p.symbol, -p.side, p.qty, OrderType.STOP, now, "stop", stop=p.stop.current))
-        p.stop_order_id = so.id
+        elif fl.tag == "stop" and p.stop_order_id == fl.order_id and (o is None or o.done):
+            p.stop_order_id = None
+            self._place_stop(p, now)
 
     def _close(self, p: Position, fl: Fill, reason: str, now: float) -> None:
-        if p.stop_order_id:
-            self.broker.cancel(p.stop_order_id)
+        if p.stop_order_id and p.stop_order_id != fl.order_id:
+            self._cancel_stop(p)
         net = p.realized - p.fees
         r = net / (p.initial_risk_per_share * p.orig_qty) if p.initial_risk_per_share and p.orig_qty else 0.0
         ct = ClosedTrade(p.symbol, p.side, p.setup, p.entry_ts, now, p.orig_qty, p.avg_px, fl.price, round(net, 2),
@@ -533,7 +601,7 @@ class TradingSystem:
                                         "reason": self.risk.reasons[-1][2] if self.risk.reasons else ""})
         if self.risk.state is RiskState.HALTED:
             for p in list(self.book.positions.values()):
-                if not p.exiting:
+                if not p.exiting and not p.working_exit:
                     self._exit(p, p.qty, "flatten: risk HALTED", now)
 
     def health_check(self, clock_drift_s: float = 0.0) -> None:
@@ -542,7 +610,9 @@ class TradingSystem:
         # Staleness is measured within the current session (first bar of the day
         # is due one minute after the open, plus a grace period).
         mso = self.session.minutes_since_open(now)
-        ref = now - max(mso, 0) * 60 + 120
+        ref = now - max(mso, 0) * 60 + self.bar_s + 120
+        # ...and from when the live stream started, so a mid-session start is not "stale".
+        ref = max(ref, self.stream_start_ts + self.bar_s + 120)
         last = max(self.last_bar_ts.values()) if self.last_bar_ts else ref
         stale = max(0.0, now - max(last, ref))
         book = {s: p.side * p.qty for s, p in self.book.positions.items()}
@@ -554,7 +624,7 @@ class TradingSystem:
         else:
             self.reconcile_miss = 0
         prev = self.risk.state
-        self.risk.check_infrastructure(data_staleness_s=stale, clock_drift_s=clock_drift_s,
+        self.risk.check_infrastructure(data_staleness_s=stale, staleness_limit_s=self.staleness_limit, clock_drift_s=clock_drift_s,
                                        broker_ok=self.broker.connected, reconciled=reconciled, market_open=open_, ts=now)
         if self.risk.state is not prev:
             self.J.write("risk", now, {"event": "state_change", "state": self.risk.state.value,

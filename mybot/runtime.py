@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from .audit.journal import Journal
 from .backtest.engine import build_system, deflated_sharpe, metrics, monte_carlo, replay
 from .config import Settings
-from .core.clock import SimClock, WallClock
+from .core.clock import SimClock, live_clock
 from .core.events import Topic
 from .data.synthetic import SyntheticMarket
 from .engine.orchestrator import TradingSystem
@@ -25,6 +25,7 @@ from .execution.paper import PaperBroker
 from .learning.research import ModelRegistry
 
 log = logging.getLogger(__name__)
+LIVE_CONFIRM = "I_UNDERSTAND_THE_RISKS"
 
 
 class Runtime:
@@ -37,11 +38,13 @@ class Runtime:
         self.status_line = "starting"
         self.boot_info: dict = {}
         self.registry = ModelRegistry(settings.data_dir)
+        self.preflight_report: dict = {}
         if settings.mode == "live":
-            if os.environ.get("MYBOT_LIVE_CONFIRM") != "I_UNDERSTAND_THE_RISKS":
-                raise SystemExit("Refusing live mode: set MYBOT_LIVE_CONFIRM=I_UNDERSTAND_THE_RISKS after reading docs/OPERATIONS.md")
             if self.simulated:
-                raise SystemExit("Live mode requires a real data source")
+                raise SystemExit("Live mode needs real market data: use --data alpaca (or data_source = \"alpaca\").")
+            if os.environ.get("MYBOT_LIVE_CONFIRM") != LIVE_CONFIRM:
+                raise SystemExit("Refusing LIVE trading. Real money is at risk. After completing the go-live ladder in "
+                                 f"docs/OPERATIONS.md, set MYBOT_LIVE_CONFIRM={LIVE_CONFIRM} and use your LIVE Alpaca keys.")
         journal = Journal(settings.data_dir)
         if self.simulated:
             self.market = SyntheticMarket(list(settings.symbols), settings.market_proxy, seed=int(time.time()) % 10000)
@@ -53,26 +56,65 @@ class Runtime:
         else:
             from .data.alpaca import AlpacaData
             from .execution.alpaca import AlpacaBroker
-            clock = WallClock()
+            clock = live_clock()
             broker = AlpacaBroker(paper=settings.mode != "live")
-            self.feed = AlpacaData(list(settings.symbols) + [settings.market_proxy])
-            self.mode_label = f"{settings.mode.upper()} · ALPACA ({self.feed.feed.upper()} feed)"
+            broker.now = clock.now
+            self.feed = AlpacaData(list(dict.fromkeys(list(settings.symbols) + [settings.market_proxy])))
+            label = "LIVE · REAL MONEY" if settings.mode == "live" else "PAPER"
+            self.mode_label = f"{label} · ALPACA ({self.feed.feed.upper()} data)"
         self.system = TradingSystem(settings, clock, broker, journal, live=True)
         self.system.mode_label = self.mode_label
+        if not self.simulated:
+            self._preflight()
+
+    def _preflight(self) -> None:
+        """Broker checks before anything else: account usable, real equity, PDT rule, leftovers."""
+        s, rep = self.system, self.system.broker.preflight()
+        self.preflight_report = rep
+        now = s.clock.now()
+        # Size from the REAL account, not the config's starting_equity.
+        s.book.cash = s.book.start_equity = s.book.day_start_equity = s.book.hwm = rep["equity"]
+        s.risk.pdt_remaining = s.broker.day_trades_remaining()
+        if rep["positions"]:
+            s.risk.halt(f"pre-existing broker positions {rep['positions']}: this engine did not open them and will not "
+                        "manage them. Close them at the broker (or reconcile), then resume.", now)
+        if not rep["shorting_enabled"] and s.S.risk.allow_short:
+            log.warning("account cannot short; short setups will be rejected by the broker")
+        s.J.write("risk", now, {"event": "preflight", "state": s.risk.state.value,
+                                 "reason": f"equity ${rep['equity']:,.2f}; PDT-limited={rep['pdt_limited']}; "
+                                           f"day trades left={s.risk.pdt_remaining}; stale orders cancelled={len(rep['stale_orders_cancelled'])}"})
 
     # ------------------------------------------------------------ bootstrap
-    def bootstrap(self) -> None:
+    async def bootstrap(self) -> None:
         """Research -> backtest before trading: build the knowledge base from history.
 
-        Synthetic mode: a separate simulated history. Real-data mode: load the
-        persisted knowledge base (populate it with `python -m mybot backtest` on
-        vendor history first)."""
+        Synthetic mode replays a separate simulated history. Real-data mode downloads
+        recent real 1-minute bars from Alpaca and replays them through the same engine
+        (bars only), so analogues and the backtest report come from REAL data."""
         info = self.system.load_knowledge(self.registry, self.S.mode)
         self.boot_info = info
-        if not self.simulated or info["analogues"] >= 300:
+        if info["analogues"] >= 300:
             self.backtest_report = {"status": "loaded persisted knowledge base", **info}
             return
-        self.status_line = f"bootstrapping knowledge base from {self.bootstrap_days} simulated days"
+        if self.simulated:
+            self.status_line = f"bootstrapping knowledge base from {self.bootstrap_days} simulated days"
+            bt = await asyncio.to_thread(self._replay_synthetic_history)
+            label = "SIMULATED (not evidence of edge)"
+        else:
+            self.status_line = f"downloading ~{self.bootstrap_days} days of real 1-minute history for the knowledge base"
+            try:
+                events = await self.feed.history_events(self.bootstrap_days, now=self.system.clock.now())
+            except Exception as exc:
+                log.warning("history download failed: %s", exc)
+                self.backtest_report = {"status": f"history download failed ({type(exc).__name__}); no analogues -> "
+                                                  "every candidate is vetoed until the knowledge base exists", **info}
+                return
+            self.status_line = f"replaying {len(events):,} real bars through the engine"
+            bt = await asyncio.to_thread(self._replay_events, events)
+            label = "REAL Alpaca 1-minute bars (bars only, no quotes): still a small sample"
+        self._absorb(bt, info, label)
+
+    def _replay_synthetic_history(self):
         hist = SyntheticMarket(list(self.S.symbols), self.S.market_proxy, seed=12345)
         days = hist.trading_days(datetime(2025, 1, 6), self.bootstrap_days)
         first = hist.day_events(days[0])
@@ -80,16 +122,24 @@ class Runtime:
         replay(bt, first)
         for d in days[1:]:
             replay(bt, hist.day_events(d))
+        return bt
+
+    def _replay_events(self, events):
+        bt = build_system(self.S, None, events[0][0] - 1 if events else 0.0)
+        replay(bt, events)
+        return bt
+
+    def _absorb(self, bt, info: dict, label: str) -> None:
         for o in bt.analogues.items:
             self.system.analogues.add(o)
-            self.system.J.outcome(o)
+            self.system.J.outcome(o, self.system.kb_source)
         for k, v in bt.drift.ref.items():
             self.system.drift.ref[k].extend(v)
         m = metrics(bt)
         import numpy as np
         r = np.array([t.r for t in bt.book.closed])
         self.backtest_report = {
-            "status": "done", "days": self.bootstrap_days, "data": "SIMULATED (not evidence of edge)",
+            "status": "done", "days": self.bootstrap_days, "data": label,
             "metrics": m.to_dict(), "monte_carlo": monte_carlo(r, self.S.risk.risk_per_trade_pct),
             "deflated_sharpe_prob": round(deflated_sharpe(m.sharpe_daily / (252 ** 0.5), self.bootstrap_days, n_trials=4), 3),
             "analogues_learned": len(bt.analogues.items),
@@ -99,12 +149,13 @@ class Runtime:
 
     # ------------------------------------------------------------ loops
     async def run(self) -> None:
-        await asyncio.to_thread(self.bootstrap)
-        self.status_line = "running"
+        await self.bootstrap()
+        self.status_line = "running" if self.system.risk.state.value != "HALTED" else "HALTED - see risk events"
         tasks = [asyncio.create_task(self._health_loop())]
         if self.simulated:
             tasks.append(asyncio.create_task(self._synthetic_loop()))
         else:
+            self.system.stream_start_ts = self.system.clock.now()
             tasks.append(asyncio.create_task(self.feed.run(self.system)))
             tasks.append(asyncio.create_task(self.system.broker.run(self.system)))
         await asyncio.gather(*tasks)

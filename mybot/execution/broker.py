@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import itertools
+import secrets
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
@@ -23,6 +24,10 @@ class OrderStatus(str, Enum):
 
 
 _ids = itertools.count(1)
+# Client order ids must be unique per broker account *across restarts*, so every
+# process run gets its own random prefix. "mb" marks orders created by this system.
+RUN_ID = secrets.token_hex(3)
+ORDER_PREFIX = "mb"
 
 
 @dataclass
@@ -35,7 +40,7 @@ class Order:
     tag: str                 # entry | exit | stop | reduce | flatten
     limit: float | None = None
     stop: float | None = None
-    id: str = field(default_factory=lambda: f"o{next(_ids)}")
+    id: str = field(default_factory=lambda: f"{ORDER_PREFIX}{RUN_ID}-{next(_ids)}")
     status: OrderStatus = OrderStatus.NEW
     filled: int = 0
     avg_px: float = 0.0
@@ -76,7 +81,9 @@ class Broker:
     def submit(self, o: Order) -> Order:  # pragma: no cover
         raise NotImplementedError
 
-    def cancel(self, order_id: str) -> None:  # pragma: no cover
+    def cancel(self, order_id: str) -> bool:  # pragma: no cover
+        """Cancel; return True only if the order is now inactive WITHOUT having filled
+        further (i.e. it is safe to send a replacement). False if it filled first."""
         raise NotImplementedError
 
     def replace_stop(self, order_id: str, new_stop: float) -> None:  # pragma: no cover

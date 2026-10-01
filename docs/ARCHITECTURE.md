@@ -112,7 +112,7 @@ flowchart LR
 
 | # | Engine | Where | Status |
 |---|---|---|---|
-| 1 | Market Data | `data/synthetic.py`, `data/alpaca.py` | [IMPL] synthetic · [IFACE] Alpaca IEX/SIP |
+| 1 | Market Data | `data/synthetic.py`, `data/alpaca.py`, `data/csv_loader.py` | [IMPL] synthetic, CSV, Alpaca (tested against a local fake Alpaca, not yet the real API) |
 | 2 | Data Quality | `data/quality.py` | [IMPL] |
 | 3 | Event streaming | `core/events.py` (in-process); Redpanda/NATS in prod | [IMPL] in-proc · [PLAN] durable log |
 | 4 | Feature engineering | `features/engine.py`, `features/indicators.py` | [IMPL] |
@@ -138,7 +138,7 @@ flowchart LR
 | 24 | Position sizing | `risk/sizing.py` | [IMPL] |
 | 25 | Dynamic stop | `risk/stops.py` | [IMPL] |
 | 26 | Dynamic take-profit | partials, trailing, target-2 in orchestrator | [IMPL] |
-| 27 | Execution | `execution/paper.py`, `execution/alpaca.py` | [IMPL] paper · [IFACE] Alpaca |
+| 27 | Execution | `execution/paper.py`, `execution/alpaca.py` | [IMPL] paper · Alpaca paper/live (fake-Alpaca E2E tested) |
 | 28 | Portfolio exposure | risk engine caps (gross, sector, positions) | [IMPL] · [PLAN] correlation matrix |
 | 29 | Position monitoring | `engine/orchestrator.py::_manage_position`, news-triggered reassessment | [IMPL] |
 | 30 | Research orchestrator | `engine/orchestrator.py` | [IMPL] |
@@ -608,6 +608,16 @@ Implemented (`tests/`, run `pytest`):
 - **System**: multi-day end-to-end backtest has no handler errors, is flat at the close and reconciles with the broker; every decision has a bull and bear case; decision reconstruction works; the hash chain detects tampering.
 - **Failure**: broker disconnect → HALT; feed stops mid-session → HALT with a "stale" reason.
 - **API/security**: state endpoint; kill and resume require the token when configured.
+
+Added after deep validation (`tests/test_live_path.py`, `tests/e2e_alpaca.py`, `scripts/soak.py`):
+- **Exit/stop race**: an exit cancels the resting stop first, with confirmation, so it never flips the position and never hits "insufficient qty".
+- **Rejected or lost stop**: the position is closed, and any position found without a resting stop is closed on the next bar.
+- **Order ids** unique across restarts. **Bars-only** paper fills, with same-bar stop testing. **CSV loader** is point-in-time.
+- **Knowledge-base partitions**: simulated and real analogues never mix. **PDT** limit. **Live guard**. The test clock is refused against real brokers.
+- **Alpaca adapter vs a fake Alpaca** (REST + websocket): pre-flight, reservation semantics, replace → new id, async cancels, 5xx → disconnected, only our stale orders cancelled.
+- **End-to-end** with the real runtime process: paper trading, kill switch flattening at the broker, live-mode guard, leftover positions halt, broker outage halt, stop rejection, PDT.
+- **Soak with fault injection**: about 3,700 corrupted records per run (duplicates, crossed quotes, bad OHLC, zero prices). Invariants checked: accounting identity, stops never loosen, flat at the close, book = broker, every ENTER passed every gate.
+- **Real data**: 234 days of real SPY 5-minute bars (public dataset), normal and stress mode, all invariants hold.
 
 [PLAN] Latency benchmarks in CI (fail if p95 per bar > 5 ms), a chaos suite (kill the feed/broker/DB mid-session in a
 replay), fuzzing of adapters with malformed vendor messages, golden-file replay regression (same input → identical

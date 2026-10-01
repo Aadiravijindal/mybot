@@ -31,6 +31,7 @@ class PaperBroker(Broker):
         self.halted: set[str] = set()
         self.daily_vol_sigma: dict[str, float] = {}
         self.adv: dict[str, float] = {}
+        self.last_bar: dict[str, Bar] = {}
         self.connected = True
 
     # ------------------------------------------------------------------ API
@@ -39,8 +40,8 @@ class PaperBroker(Broker):
             o.status, o.reject_reason = OrderStatus.REJECTED, "broker disconnected"
         elif o.symbol in self.halted:
             o.status, o.reject_reason = OrderStatus.REJECTED, "symbol halted"
-        elif o.type is OrderType.MARKET and o.symbol not in self.quotes:
-            o.status, o.reject_reason = OrderStatus.REJECTED, "no quote"
+        elif o.type is OrderType.MARKET and o.symbol not in self.quotes and o.symbol not in self.last_bar:
+            o.status, o.reject_reason = OrderStatus.REJECTED, "no market data for symbol"
         elif o.qty <= 0:
             o.status, o.reject_reason = OrderStatus.REJECTED, "qty<=0"
         else:
@@ -50,12 +51,17 @@ class PaperBroker(Broker):
             self.on_order(o)
         return o
 
-    def cancel(self, order_id: str) -> None:
+    def cancel(self, order_id: str) -> bool:
         o = self.orders.get(order_id)
-        if o and not o.done:
+        if o is None:
+            return True
+        if o.status is OrderStatus.FILLED:
+            return False
+        if not o.done:
             o.status = OrderStatus.CANCELED
             if self.on_order:
                 self.on_order(o)
+        return True
 
     def replace_stop(self, order_id: str, new_stop: float) -> None:
         o = self.orders.get(order_id)
@@ -108,10 +114,27 @@ class PaperBroker(Broker):
                     self._fill(o, o.remaining, base * (1 + o.side * self.c.slippage_bps / 1e4), q.avail_ts)
 
     def on_bar(self, b: Bar) -> None:
-        """Bars-only fallback matching (used when no quote stream is available)."""
+        """Bars-only fallback matching (used when no quote stream is available).
+
+        Intrabar order is unknown, so the model is pessimistic: market orders fill at
+        the open, and a stop placed as a consequence of such a fill (protective stop
+        after an entry) is still tested against the SAME bar's range.
+        """
         sym = b.symbol
+        self.last_bar[sym] = b
         half_spread = b.close * 2e-4
-        for o in list(self.orders.values()):
+        before = set(self.orders)
+        self._match_bar(b, half_spread, list(self.orders.values()))
+        born = [o for oid, o in self.orders.items() if oid not in before and o.type is OrderType.STOP and not o.done]
+        for o in born:
+            if o.symbol == sym and ((o.side < 0 and b.low <= o.stop) or (o.side > 0 and b.high >= o.stop)):
+                # If the stop sits beyond the open (entry filled after a gap through it), fill at the worse open.
+                px = min(o.stop, b.open) if o.side < 0 else max(o.stop, b.open)
+                self._fill(o, o.remaining, px * (1 + o.side * self.c.slippage_bps / 1e4) + o.side * half_spread, b.avail_ts)
+
+    def _match_bar(self, b: Bar, half_spread: float, orders: list) -> None:
+        sym = b.symbol
+        for o in orders:
             if o.done or o.symbol != sym or b.avail_ts < o.ts + self.c.latency_s:
                 continue
             if o.type is OrderType.STOP:

@@ -51,6 +51,8 @@ class RiskEngine:
         self.order_times: deque = deque(maxlen=200)
         self.component_errors: deque = deque(maxlen=100)
         self.day: str | None = None
+        # US pattern-day-trader rule: None = unlimited; otherwise day trades left in the rolling window.
+        self.pdt_remaining: int | None = None
 
     # ------------------------------------------------------------- state
     def _escalate(self, new: RiskState, reason: str, ts: float) -> None:
@@ -107,8 +109,10 @@ class RiskEngine:
             self.halt(f"repeated component failures ({what})", ts)
 
     def check_infrastructure(self, *, data_staleness_s: float, clock_drift_s: float,
-                             broker_ok: bool, reconciled: bool, market_open: bool, ts: float) -> None:
-        if market_open and data_staleness_s > self.L.max_data_staleness_s:
+                             broker_ok: bool, reconciled: bool, market_open: bool, ts: float,
+                             staleness_limit_s: float | None = None) -> None:
+        limit = staleness_limit_s if staleness_limit_s is not None else self.L.max_data_staleness_s
+        if market_open and data_staleness_s > limit:
             self.halt(f"market data stale for {data_staleness_s:.0f}s", ts)
         if abs(clock_drift_s) > self.L.max_clock_drift_s:
             self.halt(f"clock drift {clock_drift_s:.2f}s", ts)
@@ -129,6 +133,8 @@ class RiskEngine:
             return RiskDecision(False, 0, ["max open positions"])
         if self.trades_today >= L.max_trades_per_day:
             return RiskDecision(False, 0, ["max trades per day"])
+        if self.pdt_remaining is not None and self.pdt_remaining <= 0:
+            return RiskDecision(False, 0, ["pattern-day-trader limit: no day trades left (account < $25k)"])
         recent = [t for t in self.order_times if ts - t < 60]
         if len(recent) >= L.max_orders_per_minute:
             return RiskDecision(False, 0, ["order rate limit"])
@@ -164,8 +170,10 @@ class RiskEngine:
         self.order_times.append(ts)
         if opening:
             self.trades_today += 1
+            if self.pdt_remaining is not None:
+                self.pdt_remaining -= 1
 
     def snapshot(self) -> dict:
-        return {"state": self.state.value, "trades_today": self.trades_today,
+        return {"state": self.state.value, "trades_today": self.trades_today, "pdt_day_trades_left": self.pdt_remaining,
                 "consecutive_losses": self.consec_losses,
                 "recent_reasons": [{"ts": t, "state": s, "reason": r} for t, s, r in list(self.reasons)[-10:]]}

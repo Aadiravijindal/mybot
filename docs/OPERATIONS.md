@@ -7,6 +7,15 @@
 4. Check the economic calendar for high-impact events. The engine blacks out entries around them, but you should know what's coming.
 5. Model monitor: any setup marked DEGRADED or DISABLED stays that way until it has been re-validated.
 
+## Start-up pre-flight (automatic, real-data modes)
+The engine refuses to trade until these pass. The results are logged as a `preflight` risk event on the dashboard:
+* account ACTIVE and not trading-blocked (otherwise it exits with the reason);
+* equity read from the broker becomes the sizing base;
+* **pattern-day-trader rule**: margin accounts under $25k get 3 day trades per rolling 5 business days. Every round
+  trip of this intraday system uses one, and when none are left new entries are blocked;
+* **positions it didn't open → HALT.** It will not manage or close them. Close or transfer them yourself, then resume;
+* stale open orders created by a previous run (client order id `mb…`) are cancelled. Your manual orders are left alone.
+
 ## Incidents
 | Symptom | Do this |
 |---|---|
@@ -15,6 +24,8 @@
 | HALTED: "broker disconnected" | Check the broker status page and your API keys. Confirm open orders and stops at the broker. |
 | HALTED: "daily loss" / "drawdown" | Do **not** resume the same day. Review the attribution for every trade. Treat it as a research event, not an execution problem. |
 | REDUCE_ONLY: slippage or loss streak | It clears at the next session. Review the execution quality first. |
+| HALTED: "pre-existing broker positions" | Positions in the account that this engine didn't open. Close them at the broker (or move them to another account), then resume. |
+| Risk event "stop_lost" | The broker refused or cancelled a protective stop. The engine closes that position automatically. Find out why (shortability, price increments, account restrictions). |
 | Dashboard unreachable | Positions stay protected by broker-resident stops. SSH in, check `docker compose logs`, restart, reconcile. |
 
 **Cool-down rule:** after any HALT caused by losses, wait at least one full session and write down the cause before resuming.

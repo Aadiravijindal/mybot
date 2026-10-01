@@ -53,7 +53,7 @@ def _stop_short(f, atr, mult):
 
 
 def generate(sym: str, ts: float, f: dict[str, float], regime: Regime, catalyst: float,
-             atr_mult: float = 1.5, allow_short: bool = True) -> list[Candidate]:
+             atr_mult: float = 1.5, allow_short: bool = True, bar_seconds: int = 60) -> list[Candidate]:
     if "atr" not in f or "vwap" not in f:
         return []
     c, atr = f["close"], f["atr"]
@@ -63,7 +63,8 @@ def generate(sym: str, ts: float, f: dict[str, float], regime: Regime, catalyst:
         stop = _stop_long(f, atr, atr_mult) if side is Side.LONG else _stop_short(f, atr, atr_mult)
         risk = abs(c - stop)
         tg = [c + side.sign * r * risk for r in tgt_r]
-        out.append(Candidate(sym, setup, side, ts, c, stop, tg, horizon, dict(f), rationale))
+        bars = max(3, round(horizon * 60 / bar_seconds))   # horizon is in minutes
+        out.append(Candidate(sym, setup, side, ts, c, stop, tg, bars, dict(f), rationale))
 
     htf = f.get("htf_trend", 0.0)
     rsi = f.get("rsi", 50)

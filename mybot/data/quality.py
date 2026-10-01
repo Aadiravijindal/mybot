@@ -27,7 +27,8 @@ class SymbolDQ:
 
 class DataQualityEngine:
     def __init__(self, max_staleness_s: float = 180.0, max_jump_pct: float = 8.0,
-                 max_spread_bps: float = 150.0, disagreement_bps: float = 30.0):
+                 max_spread_bps: float = 150.0, disagreement_bps: float = 30.0, bar_seconds: int = 60):
+        self.bar_seconds = bar_seconds
         self.max_staleness_s = max_staleness_s
         self.max_jump_pct = max_jump_pct
         self.max_spread_bps = max_spread_bps
@@ -60,7 +61,7 @@ class DataQualityEngine:
             st.rejected += 1
             self._flag(b.symbol, now, bad)
             return False
-        if st.last_bar_end and b.ts - st.last_bar_end > 60 * 5 and b.ts - st.last_bar_end < 3600 * 6:
+        if st.last_bar_end and b.ts - st.last_bar_end > max(300, 3 * self.bar_seconds) and b.ts - st.last_bar_end < 3600 * 6:
             self._flag(b.symbol, now, f"gap of {(b.ts - st.last_bar_end) / 60:.0f} min in bars (halt or feed gap)")
         st.last_bar_ts, st.last_bar_end, st.last_close = b.ts, b.end_ts, b.close
         st.accepted += 1

@@ -63,7 +63,10 @@ class Journal:
         c.execute("CREATE TABLE IF NOT EXISTS decisions (id TEXT PRIMARY KEY, ts REAL, symbol TEXT, action TEXT, record TEXT)")
         c.execute("CREATE INDEX IF NOT EXISTS ix_dec_sym_ts ON decisions(symbol, ts)")
         c.execute("CREATE TABLE IF NOT EXISTS trades (decision_id TEXT, symbol TEXT, entry_ts REAL, exit_ts REAL, pnl REAL, r REAL, record TEXT)")
-        c.execute("CREATE TABLE IF NOT EXISTS outcomes (setup TEXT, side INT, start_ts REAL, outcome_ts REAL, r REAL, mae REAL, mfe REAL, exit TEXT, regime TEXT, vec TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS outcomes (setup TEXT, side INT, start_ts REAL, outcome_ts REAL, r REAL, mae REAL, mfe REAL, exit TEXT, regime TEXT, vec TEXT, source TEXT)")
+        cols = {r[1] for r in c.execute("PRAGMA table_info(outcomes)")}
+        if "source" not in cols:   # migrate databases created before source tagging
+            c.execute("ALTER TABLE outcomes ADD COLUMN source TEXT DEFAULT 'synthetic'")
         c.execute("CREATE TABLE IF NOT EXISTS news (id TEXT PRIMARY KEY, ts REAL, avail_ts REAL, symbols TEXT, event_type TEXT, record TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS models (name TEXT, version TEXT, status TEXT, created_ts REAL, metrics TEXT)")
         c.commit()
@@ -92,15 +95,21 @@ class Journal:
                                  payload["event_type"], dumps(payload)))
             self.db.commit()
 
-    def outcome(self, o) -> None:
+    def outcome(self, o, source: str) -> None:
+        """Store a labelled outcome, tagged with the data source it was learned from.
+        Analogues learned on simulated data must never inform decisions on real data."""
         with self.lock:
-            self.db.execute("INSERT INTO outcomes VALUES (?,?,?,?,?,?,?,?,?,?)",
-                            (o.setup, o.side, o.start_ts, o.outcome_ts, o.r, o.mae_r, o.mfe_r, o.exit, o.regime, dumps(o.vec)))
+            self.db.execute("INSERT INTO outcomes (setup, side, start_ts, outcome_ts, r, mae, mfe, exit, regime, vec, source) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                            (o.setup, o.side, o.start_ts, o.outcome_ts, o.r, o.mae_r, o.mfe_r, o.exit, o.regime, dumps(o.vec), source))
             self.db.commit()
 
-    def load_outcomes(self):
-        cur = self.db.execute("SELECT setup, side, start_ts, outcome_ts, r, mae, mfe, exit, regime, vec FROM outcomes")
-        return cur.fetchall()
+    def load_outcomes(self, source: str | None = None):
+        q = "SELECT setup, side, start_ts, outcome_ts, r, mae, mfe, exit, regime, vec FROM outcomes"
+        with self.lock:
+            if source is None:
+                return self.db.execute(q).fetchall()
+            return self.db.execute(q + " WHERE source = ?", (source,)).fetchall()
 
     def decision_at(self, symbol: str, ts: float) -> dict | None:
         """Reconstruct: the latest decision for ``symbol`` at or before ``ts``."""

@@ -33,22 +33,55 @@ The console prints an **admin token** at startup. You need it only to *resume* a
 
 Docker: `docker compose up`. The dashboard is published to the host's localhost only. Inside a container the API is token-protected, so the page asks once for the admin token shown in `docker compose logs`.
 
-## Real market data (Alpaca paper account)
+## Paper trading on real data, then live (Alpaca)
+
+**Step 1: paper (do this for weeks first).** Create a free Alpaca account and generate **paper** API keys.
 
 ```bash
 pip install -e ".[live]"
-cp .env.example .env        # fill in ALPACA_API_KEY_ID / ALPACA_API_SECRET_KEY (paper keys)
+cp .env.example .env        # paste your PAPER keys
 set -a; . ./.env; set +a
-python scripts/check_alpaca.py          # verify credentials, feed and paper broker first
-MYBOT_DATA_SOURCE=alpaca python -m mybot
+python scripts/check_alpaca.py          # verifies keys, account and data. Places NO orders.
+python -m mybot --data alpaca           # PAPER trading on real market data
 ```
 
-The free IEX feed covers about 2–3% of US volume, so volume and spread features are biased. `ALPACA_DATA_FEED=sip`
-needs Alpaca's paid plan. Live trading needs `MYBOT_MODE=live` **and**
-`MYBOT_LIVE_CONFIRM=I_UNDERSTAND_THE_RISKS`. Don't set these until you've read `docs/OPERATIONS.md`.
+On start it runs **pre-flight checks**:
+- the account must be active and allowed to trade;
+- it sizes from your **real account equity**, not the config number;
+- it applies the US **pattern-day-trader** rule (under $25k equity you get only 3 day trades per 5 days);
+- it **halts** if the account holds positions it didn't open, and never touches them;
+- it cancels any stale orders it left behind, and never touches your own orders.
+
+It then downloads recent real 1-minute history to build its knowledge base before trading.
+
+**Step 2: live (real money).** Only after the go-live ladder in `docs/OPERATIONS.md`. Use your **live** keys and both switches:
+
+```bash
+MYBOT_LIVE_CONFIRM=I_UNDERSTAND_THE_RISKS python -m mybot --data alpaca --mode live
+```
+
+Without the confirmation variable, live mode refuses to start. The dashboard turns red and says **LIVE · REAL MONEY**.
+The free IEX feed covers about 2–3% of US volume, so volume and spread features are biased. `ALPACA_DATA_FEED=sip` needs
+Alpaca's paid data plan.
 
 Optional LLM research (structured extraction from news; never predicts prices, never sees credentials):
 `pip install -e ".[llm]"` and set `ANTHROPIC_API_KEY`.
+
+## Validation (what has been tested, and how to re-run it)
+
+```bash
+pytest                                     # 41 unit/regression tests (~10 s)
+python tests/e2e_alpaca.py                 # real runtime vs a local fake Alpaca: paper, live guard, leftovers,
+                                           #   broker outage, stop rejection, PDT  (~15 min)
+python scripts/soak.py --seeds 6 --days 10 --stress --faults   # many simulated days with corrupted data;
+                                           #   checks accounting, stops never loosen, flat at close, book == broker
+python -m mybot backtest --source csv --csv path/to/SPY.csv:SPY --symbols SPY --proxy QQQ   # any OHLCV CSV
+```
+
+The fake Alpaca reproduces the broker behaviours that break naive bots. Shares reserved by a resting stop can't be
+sold again, replacing an order creates a new order id, cancels are asynchronous, and the API can be made to fail
+or refuse stops. Nothing here has been run against the real Alpaca API, because this build environment can't reach it.
+`scripts/check_alpaca.py` is your first real contact. Run it before anything else.
 
 ## Research tools
 
@@ -57,7 +90,6 @@ python -m mybot backtest --days 40        # event-driven backtest + Monte Carlo 
 python -m mybot walkforward --train 20 --test 5 --folds 4
 python -m mybot research                  # walk-forward feature ablation on the knowledge base
 python -m mybot verify-audit              # verify the tamper-evident decision journal
-pytest                                    # 27 tests: look-ahead, risk, stops, failures, API security...
 ```
 
 ### What the numbers say (synthetic market, 40 days, seed 3)

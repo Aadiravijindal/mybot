@@ -18,7 +18,8 @@ def build(rt) -> dict:
     L = s.S.risk
     gross = sum(abs(p.qty * b.marks.get(sym, p.avg_px)) for sym, p in s.book.positions.items())
     day_pnl = eq - b.day_start_equity
-    dd = (1 - eq / b.hwm) * 100 if b.hwm else 0
+    hwm = max(b.hwm, eq)   # the stored peak only updates once a minute
+    dd = max(0.0, (1 - eq / hwm) * 100) if hwm else 0
     positions = []
     for sym, p in s.book.positions.items():
         px = b.marks.get(sym, p.avg_px)
@@ -55,7 +56,7 @@ def build(rt) -> dict:
                  "status_line": rt.status_line, "boot": rt.boot_info},
         "account": {"equity": _r(eq), "cash": _r(b.cash), "day_pnl": _r(day_pnl),
                     "day_pnl_pct": _r(day_pnl / b.day_start_equity * 100, 3), "total_pnl": _r(eq - b.start_equity),
-                    "hwm": _r(b.hwm), "drawdown_pct": _r(dd, 3), "gross_exposure": _r(gross), "open_positions": len(positions),
+                    "hwm": _r(hwm), "drawdown_pct": _r(dd, 3), "gross_exposure": _r(gross), "open_positions": len(positions),
                     "closed_trades": len(b.closed), "win_rate": _r(np.mean([r > 0 for r in rs]), 3) if rs else None,
                     "expectancy_r": _r(np.mean(rs), 3) if rs else None},
         "risk": {**s.risk.snapshot(), "utilization": util, "limits": s.S.risk.__dict__},

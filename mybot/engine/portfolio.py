@@ -36,6 +36,8 @@ class Position:
     entry_slippage_bps: float = 0.0
     research: list = field(default_factory=list)   # new information seen while open
     orig_qty: int = 0
+    working_exit: str | None = None               # id of an in-flight exit/reduce order
+    stop_failures: int = 0                         # consecutive protective-stop rejections
 
     def r_now(self, px: float) -> float:
         return (px - self.avg_px) * self.side / self.initial_risk_per_share if self.initial_risk_per_share else 0.0
